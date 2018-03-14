@@ -19,6 +19,7 @@
 #include <fcntl.h>                               // O_RDONLY
 #include <signal.h>
 
+#include "butil/build_config.h"                  // OS_LINUX
 // Naming services
 #ifdef BAIDU_INTERNAL
 #include "brpc/policy/baidu_naming_service.h"
@@ -30,6 +31,7 @@
 
 // Load Balancers
 #include "brpc/policy/round_robin_load_balancer.h"
+#include "brpc/policy/weighted_round_robin_load_balancer.h"
 #include "brpc/policy/randomized_load_balancer.h"
 #include "brpc/policy/locality_aware_load_balancer.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
@@ -62,14 +64,26 @@
 #include "brpc/socket_map.h"          // SocketMapList
 #include "brpc/server.h"
 #include "brpc/trackme.h"             // TrackMe
-#include <malloc.h>                        // malloc_trim
 #include "brpc/details/usercode_backup_pool.h"
+#if defined(OS_LINUX)
+#include <malloc.h>                   // malloc_trim
+#endif
 #include "butil/fd_guard.h"
 #include "butil/files/file_watcher.h"
+
+extern "C" {
+// defined in gperftools/malloc_extension_c.h
+void BAIDU_WEAK MallocExtension_ReleaseFreeMemory(void);
+}
 
 namespace brpc {
 
 DECLARE_bool(usercode_in_pthread);
+
+DEFINE_int32(free_memory_to_system_interval, 0,
+             "Try to return free memory to system every so many seconds, "
+             "values <= 0 disables this feature");
+BRPC_VALIDATE_GFLAG(free_memory_to_system_interval, PassValidate);
 
 namespace policy {
 // Defined in http_rpc_protocol.cpp
@@ -93,6 +107,7 @@ struct GlobalExtensions {
     RemoteFileNamingService rfns;
 
     RoundRobinLoadBalancer rr_lb;
+    WeightedRoundRobinLoadBalancer wrr_lb;
     RandomizedLoadBalancer randomized_lb;
     LocalityAwareLoadBalancer la_lb;
     ConsistentHashingLoadBalancer ch_mh_lb;
@@ -116,7 +131,7 @@ static long ReadPortOfDummyServer(const char* filename) {
                    << (nr == 0 ? "nothing to read" : berror());
         return -1;
     }
-    port_str[sizeof(port_str)-1] = '\0';
+    port_str[std::min((size_t)nr, sizeof(port_str)-1)] = '\0';
     const char* p = port_str;
     for (; isspace(*p); ++p) {}
     char* endptr = NULL;
@@ -177,7 +192,7 @@ static void* GlobalUpdate(void*) {
     const int WARN_NOSLEEP_THRESHOLD = 2;
     int64_t last_time_us = start_time_us;
     int consecutive_nosleep = 0;
-    //int64_t last_malloc_trim_time = start_time_us;
+    int64_t last_return_free_memory_time = start_time_us;
     while (1) {
         const int64_t sleep_us = 1000000L + last_time_us - butil::gettimeofday_us();
         if (sleep_us > 0) {
@@ -214,11 +229,26 @@ static void* GlobalUpdate(void*) {
             }
         }
 
-        // TODO: Add branch for tcmalloc.
-        // if (last_time_us > last_malloc_trim_time + 10*1000000L) {
-        //     last_malloc_trim_time = last_time_us;
-        //     malloc_trim(10*1024*1024/*leave 10M pad*/);
-        // }
+        const int return_mem_interval =
+            FLAGS_free_memory_to_system_interval/*reloadable*/;
+        if (return_mem_interval > 0 &&
+            last_time_us >= last_return_free_memory_time +
+            return_mem_interval * 1000000L) {
+            last_return_free_memory_time = last_time_us;
+            // TODO: Calling MallocExtension::instance()->ReleaseFreeMemory may
+            // crash the program in later calls to malloc, verified on tcmalloc
+            // 1.7 and 2.5, which means making the static member function weak
+            // in details/tcmalloc_extension.cpp is probably not correct, however
+            // it does work for heap profilers.
+            if (MallocExtension_ReleaseFreeMemory != NULL) {
+                MallocExtension_ReleaseFreeMemory();
+            } else {
+#if defined(OS_LINUX)
+                // GNU specific.
+                malloc_trim(10 * 1024 * 1024/*leave 10M pad*/);
+#endif
+            }
+        }
     }
     return NULL;
 }
@@ -290,6 +320,7 @@ static void GlobalInitializeOrDieImpl() {
 
     // Load Balancers
     LoadBalancerExtension()->RegisterOrDie("rr", &g_ext->rr_lb);
+    LoadBalancerExtension()->RegisterOrDie("wrr", &g_ext->wrr_lb);
     LoadBalancerExtension()->RegisterOrDie("random", &g_ext->randomized_lb);
     LoadBalancerExtension()->RegisterOrDie("la", &g_ext->la_lb);
     LoadBalancerExtension()->RegisterOrDie("c_murmurhash", &g_ext->ch_mh_lb);

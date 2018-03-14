@@ -276,7 +276,7 @@ static void* string_appender(void* arg) {
     int count = 0;
     std::string id = butil::string_printf("%lld", (long long)pthread_self());
     std::string tmp = "a";
-    for (count = 0; !g_stop; ++count) {
+    for (count = 0; !count || !g_stop; ++count) {
         *cater << id << ":";
         for (char c = 'a'; c <= 'z'; ++c) {
             tmp[0] = c;
@@ -310,7 +310,7 @@ TEST_F(ReducerTest, non_primitive_mt) {
     std::string res = cater.get_value();
     for (butil::StringSplitter sp(res.c_str(), '.'); sp; ++sp) {
         char* endptr = NULL;
-        ++got_count[strtoll(sp.field(), &endptr, 10)];
+        ++got_count[(pthread_t)strtoll(sp.field(), &endptr, 10)];
         ASSERT_EQ(27LL, sp.field() + sp.length() - endptr)
             << butil::StringPiece(sp.field(), sp.length());
         ASSERT_EQ(0, memcmp(":abcdefghijklmnopqrstuvwxyz", endptr, 27));
